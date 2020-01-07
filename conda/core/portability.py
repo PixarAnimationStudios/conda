@@ -28,6 +28,9 @@ SHEBANG_REGEX = (br'^(#!'  # pretty much the whole match string
 class _PaddingError(Exception):
     pass
 
+class _NotAnELFFile(Exception):
+    pass
+
 
 def update_prefix(path, new_prefix, placeholder=PREFIX_PLACEHOLDER, mode=FileMode.text):
     if on_win and mode == FileMode.text:
@@ -92,10 +95,51 @@ def binary_replace(data, a, b):
 
     original_data_len = len(data)
     pat = re.compile(re.escape(a) + b'([^\0]*?)\0')
-    data = pat.sub(replace, data)
+
+    try:
+        data = elf_replace(data, pat, replace)
+    except _NotAnELFFile:
+        data = pat.sub(replace, data)
+
     assert len(data) == original_data_len
 
     return data
+
+def elf_replace(data, pat, replace):
+    from contextlib import closing
+    from io import BytesIO
+    from elftools.elf.elffile import ELFFile, ELFError
+
+    with closing(BytesIO(data)) as dstream:
+        try:
+            elf = ELFFile(dstream)
+        except ELFError:
+            raise _NotAnELFFile
+
+        for s in elf.iter_sections():
+            # Avoid prefix replacement:
+            #   1. In null sections, because they're null.
+            #   2. In sections of type SHT_NOBITS, as these sections do not
+            #      have any bytes in the file. They do have a size and offset,
+            #      however, so trying to edit them ends up editing subsequent
+            #      sections of the file. In some cases, trying to edit a
+            #      NOBITS section using the offset and size results in edits
+            #      to the debug sections we're trying to avoid.
+            #   3. In debug sections, because regexp replacements in these
+            #      sections edit paths in directory tables, which corrupts the
+            #      debug information making it impossible to get useful stack
+            #      information from tools like gdb or valgrind.
+            if (s.is_null() or
+                s.header['sh_type'] == 'SHT_NOBITS' or
+                s.name.startswith('.debug_')):
+                continue
+
+            modified, count = pat.subn(replace, s.data())
+            if count:
+                dstream.seek(s['sh_offset'])
+                dstream.write(modified)
+
+        return dstream.getvalue()
 
 
 def has_pyzzer_entry_point(data):
